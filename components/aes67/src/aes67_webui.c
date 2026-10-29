@@ -883,6 +883,7 @@ esp_err_t aes67_webui_start(aes67_webui_handle_t handle)
     config.max_open_sockets = 7;
     config.keep_alive_enable = false;  /* Close HTTP conns immediately, free sockets for WS */
     config.core_id = 1;  /* Run HTTP server on core 1 (audio on core 0) */
+    config.uri_match_fn = httpd_uri_match_wildcard; /* Wildcard handler to allow deleting sinks */
 
     esp_err_t ret = httpd_start(&handle->httpd, &config);
     if (ret != ESP_OK) {

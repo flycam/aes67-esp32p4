@@ -127,11 +127,22 @@ static const char *TAG = "main";
  * ESP32-P4-NANO onboard ES8311 (commented out):
  *   MCLK=13, SCLK=12, LRCK=10, DOUT=9, DIN=11
  */
-#define I2S_MCLK_GPIO       13
-#define I2S_SCLK_GPIO       36   /* BCLK -> external DAC */
-#define I2S_LRCK_GPIO       33   /* LRCLK -> external DAC */
-#define I2S_DOUT_GPIO       32   /* Data out -> external DAC */
-#define I2S_DIN_GPIO        21   /* Data in <- external ADC */
+//#define I2S_MCLK_GPIO          13
+// #define I2S_SCLK_GPIO       36   /* BCLK -> external DAC */
+// #define I2S_LRCK_GPIO       33   /* LRCLK -> external DAC */
+// #define I2S_DOUT_GPIO       32   /* Data out -> external DAC */
+// #define I2S_DIN_GPIO        21   /* Data in <- external ADC */
+
+//#define I2S_SCLK_GPIO    12
+//#define I2S_LRCK_GPIO    10
+//#define I2S_DOUT_GPIO     9
+#define I2S_DIN_GPIO     11
+
+#define I2S_SCLK_GPIO    21
+#define I2S_LRCK_GPIO    20
+#define I2S_DOUT_GPIO    22
+#define I2S_MCLK_GPIO     23
+
 /* Onboard ES8311 pins (restore for built-in codec):
  * #define I2S_SCLK_GPIO    12
  * #define I2S_LRCK_GPIO    10
@@ -147,7 +158,8 @@ static const char *TAG = "main";
 #define I2C_SDA_GPIO        7
 #define I2C_PORT            I2C_NUM_0
 #define I2C_CLK_HZ          100000
-#define ES8311_ADDR         ES8311_ADDRESS_0    /* 0x18, CE pin low */
+//#define ES8311_ADDR         ES8311_ADDRESS_1    /* 0x18, CE pin low */
+#define ES8311_ADDR         0x18    /* 0x18, CE pin low */
 
 static EventGroupHandle_t s_eth_event_group;
 
@@ -455,6 +467,76 @@ static void pa_ctrl_enable(void)
  * and ADC (capture) enabled.
  */
 static esp_err_t es8311_codec_init(void)
+{
+    /* Initialize I2C master bus */
+    i2c_config_t i2c_cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA_GPIO,
+        .scl_io_num = I2C_SCL_GPIO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_CLK_HZ,
+    };
+    esp_err_t ret = i2c_param_config(I2C_PORT, &i2c_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C param config failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = i2c_driver_install(I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C driver install failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* Create ES8311 codec handle */
+    es8311_handle_t codec = es8311_create(I2C_PORT, ES8311_ADDR);
+    if (!codec) {
+        ESP_LOGE(TAG, "ES8311 create failed");
+        return ESP_FAIL;
+    }
+
+    /* Configure clock: MCLK from MCLK pin, 48kHz sample rate.
+     * I2S uses MCLK_MULTIPLE_384 (matching official ESP-IDF example).
+     * MCLK = 48000 * 384 = 18.432 MHz */
+    es8311_clock_config_t clk_cfg = {
+        .mclk_inverted = false,
+        .sclk_inverted = false,
+        .mclk_from_mclk_pin = true,
+        .mclk_frequency = 48000 * 384,     /* 18.432 MHz */
+        .sample_frequency = 48000,
+    };
+
+    /* 32-bit resolution -- int32 maps directly, no truncation */
+    ret = es8311_init(codec, &clk_cfg, ES8311_RESOLUTION_32, ES8311_RESOLUTION_32);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ES8311 init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = es8311_voice_volume_set(codec, 70, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ES8311 volume set failed: %s", esp_err_to_name(ret));
+    }
+
+    /* Unmute DAC output */
+    ret = es8311_voice_mute(codec, false);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ES8311 unmute failed: %s", esp_err_to_name(ret));
+    }
+
+    /* Configure microphone: analog mic, 24dB gain */
+    es8311_microphone_config(codec, false);
+    es8311_microphone_gain_set(codec, ES8311_MIC_GAIN_24DB);
+
+    /* Dump ES8311 register state for debugging */
+    es8311_register_dump(codec);
+
+    ESP_LOGI(TAG, "ES8311 codec initialized (48kHz, 16-bit, MCLK=18.432MHz, vol=100)");
+    return ESP_OK;
+}
+
+static esp_err_t adau1701_codec_init(void)
 {
     /* Initialize I2C master bus */
     i2c_config_t i2c_cfg = {
