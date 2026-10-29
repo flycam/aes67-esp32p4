@@ -42,7 +42,7 @@ extern const uint8_t index_html_gz_start[] asm("_binary_index_html_gz_start");
 extern const uint8_t index_html_gz_end[]   asm("_binary_index_html_gz_end");
 
 /* JSON response buffer size for REST endpoints and WS pushes */
-#define JSON_BUF_SIZE 2048
+#define JSON_BUF_SIZE 4096
 
 /* ---- Context ---- */
 
@@ -609,17 +609,33 @@ static esp_err_t handler_ws(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* Handle incoming WS frames (e.g. pings, close) */
+    /* Two-step receive: first query the frame length, then read the payload.
+     * Skipping the payload read leaves the stream desynchronised. */
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(ws_pkt));
-    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
-
-    /* Read the frame to acknowledge it */
-    uint8_t frame_buf[128];
-    ws_pkt.payload = frame_buf;
-    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, sizeof(frame_buf));
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "WS recv failed: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "WS recv len failed: %s", esp_err_to_name(ret));
+        ctx->ws_fd = -1;
+        return ret;
+    }
+
+    if (ws_pkt.len > 0) {
+        if (ws_pkt.len > 256) {
+            ctx->ws_fd = -1;
+            return ESP_FAIL;
+        }
+        uint8_t frame_buf[257];
+        ws_pkt.payload = frame_buf;
+        ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "WS recv failed: %s", esp_err_to_name(ret));
+            ctx->ws_fd = -1;
+            return ret;
+        }
+    }
+
+    if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
         ctx->ws_fd = -1;
     }
 
@@ -646,8 +662,21 @@ static void ws_push_task(void *arg)
     while (ctx->running) {
         vTaskDelay(pdMS_TO_TICKS(500));
 
-        /* Skip if no WebSocket client connected */
-        if (ctx->ws_fd < 0 || !ctx->httpd) {
+        /* The httpd does not call the handler on the WS handshake, so find
+         * WebSocket clients by scanning the open sockets. */
+        int fds[8];
+        size_t nfds = sizeof(fds) / sizeof(fds[0]);
+        int ws_fds[8];
+        int n_ws = 0;
+        if (!ctx->httpd || httpd_get_client_list(ctx->httpd, &nfds, fds) != ESP_OK) {
+            continue;
+        }
+        for (size_t k = 0; k < nfds; k++) {
+            if (httpd_ws_get_fd_info(ctx->httpd, fds[k]) == HTTPD_WS_CLIENT_WEBSOCKET) {
+                ws_fds[n_ws++] = fds[k];
+            }
+        }
+        if (n_ws == 0) {
             continue;
         }
 
@@ -825,11 +854,12 @@ static void ws_push_task(void *arg)
         ws_pkt.payload = (uint8_t *)buf;
         ws_pkt.len = pos;
 
-        esp_err_t ret = httpd_ws_send_frame_async(ctx->httpd, ctx->ws_fd, &ws_pkt);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "WS send failed (fd=%d): %s", ctx->ws_fd,
-                     esp_err_to_name(ret));
-            ctx->ws_fd = -1;
+        for (int k = 0; k < n_ws; k++) {
+            esp_err_t ret = httpd_ws_send_frame_async(ctx->httpd, ws_fds[k], &ws_pkt);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "WS send failed (fd=%d): %s", ws_fds[k],
+                         esp_err_to_name(ret));
+            }
         }
     }
 
@@ -987,7 +1017,7 @@ esp_err_t aes67_webui_start(aes67_webui_handle_t handle)
     /* Start the 2Hz WebSocket push task on core 1 */
     handle->running = true;
     BaseType_t xret = xTaskCreatePinnedToCore(
-        ws_push_task, "aes67_ws", 4096, handle,
+        ws_push_task, "aes67_ws", 12288, handle,
         3, &handle->ws_task, 1);
     if (xret != pdPASS) {
         ESP_LOGW(TAG, "Failed to create WS push task");
